@@ -7,12 +7,15 @@ import signal
 import shutil
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Set
+from urllib.parse import parse_qs, urlparse
 
 from .config import DownloadSettings
 from .display import LivePrinter
 from .jobs import Job
 from .utils import ensure_dependency, normalize_name
+
+SPEED_MULTIPLIER = "1.25"
 
 
 async def run_command(cmd: List[str], job: Job, phase: str) -> None:
@@ -49,6 +52,82 @@ async def run_command(cmd: List[str], job: Job, phase: str) -> None:
     if exit_code != 0:
         combined = "\n".join(stdout_tail + stderr_tail)
         raise RuntimeError(f"{' '.join(cmd)} failed (exit {exit_code})\n{combined}")
+
+
+async def run_capture_output(cmd: List[str]) -> List[str]:
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_data, stderr_data = await process.communicate()
+    output_lines = [
+        line.strip()
+        for line in stdout_data.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    if process.returncode != 0:
+        stderr_text = stderr_data.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"{' '.join(cmd)} failed (exit {process.returncode})"
+            + (f"\n{stderr_text}" if stderr_text else "")
+        )
+    return output_lines
+
+
+def is_youtube_playlist_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if "youtube.com" not in host and "youtu.be" not in host:
+        return False
+    query = parse_qs(parsed.query)
+    return "list" in query or parsed.path.startswith("/playlist")
+
+
+def normalize_playlist_entry(url_or_id: str) -> str:
+    if url_or_id.startswith(("http://", "https://")):
+        return url_or_id
+    return f"https://www.youtube.com/watch?v={url_or_id}"
+
+
+async def expand_playlist_url(url: str) -> List[str]:
+    if not is_youtube_playlist_url(url):
+        return [url]
+
+    lines = await run_capture_output(
+        [
+            "yt-dlp",
+            "--flat-playlist",
+            "--print",
+            "%(webpage_url)s",
+            "--skip-download",
+            "--no-warnings",
+            url,
+        ]
+    )
+    if not lines:
+        return [url]
+
+    expanded: List[str] = []
+    seen: Set[str] = set()
+    for line in lines:
+        normalized = normalize_playlist_entry(line)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        expanded.append(normalized)
+    return expanded or [url]
+
+
+def parse_submitted_urls(submissions: List[str]) -> List[str]:
+    urls: List[str] = []
+    for raw in submissions:
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            urls.extend(part for part in stripped.split() if part)
+    return urls
 
 
 async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
@@ -89,6 +168,28 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                 shutil.move(str(downloaded), final_file)
                 job.output_dir = target_dir
 
+                job.status = "speeding"
+                sped_up_file = target_dir / f"{safe_name}_speedup.mp3"
+                await run_command(
+                    [
+                        "ffmpeg",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        str(final_file),
+                        "-filter:a",
+                        f"atempo={SPEED_MULTIPLIER}",
+                        "-q:a",
+                        "2",
+                        str(sped_up_file),
+                    ],
+                    job,
+                    "ffmpeg speed-up",
+                )
+                shutil.move(str(sped_up_file), final_file)
+
                 job.status = "splitting"
                 segment_pattern = target_dir / f"{safe_name}_part_%03d.mp3"
                 await run_command(
@@ -110,6 +211,9 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                     job,
                     "ffmpeg",
                 )
+
+                if final_file.exists():
+                    final_file.unlink()
 
                 job.status = "completed"
                 job.message = str(target_dir)
@@ -136,29 +240,64 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
     ensure_dependency("yt-dlp")
     ensure_dependency("ffmpeg")
 
-    jobs = [
-        Job(
-            index=i + 1,
-            total=len(settings.urls),
+    jobs: List[Job] = []
+    semaphore = asyncio.Semaphore(settings.jobs)
+    active_tasks: Set[asyncio.Task[None]] = set()
+    all_tasks: List[asyncio.Task[None]] = []
+
+    def refresh_totals() -> None:
+        total = len(jobs)
+        for job in jobs:
+            job.total = total
+
+    def schedule_job(url: str) -> None:
+        job = Job(
+            index=len(jobs) + 1,
+            total=0,
             url=url,
             base_dir=settings.destination,
             segment_seconds=settings.segment_seconds,
             audio_quality=settings.audio_quality,
         )
-        for i, url in enumerate(settings.urls)
-    ]
+        jobs.append(job)
+        refresh_totals()
+        task = asyncio.create_task(process_job(job, semaphore))
+        active_tasks.add(task)
+        all_tasks.append(task)
+        task.add_done_callback(active_tasks.discard)
+
+    async def schedule_urls(urls: List[str]) -> None:
+        for url in urls:
+            try:
+                expanded_urls = await expand_playlist_url(url)
+            except Exception:
+                expanded_urls = [url]
+            for expanded_url in expanded_urls:
+                schedule_job(expanded_url)
 
     printer = LivePrinter(jobs, disable_color=settings.disable_color)
     printer_task = asyncio.create_task(printer.run())
-    semaphore = asyncio.Semaphore(min(settings.jobs, len(jobs)))
-
-    job_tasks = [asyncio.create_task(process_job(job, semaphore)) for job in jobs]
+    loop = asyncio.get_running_loop()
+    idle_started_at: float | None = None
     try:
-        await asyncio.gather(*job_tasks)
+        await schedule_urls(settings.urls)
+        while True:
+            submitted_urls = parse_submitted_urls(printer.drain_submitted_urls())
+            if submitted_urls:
+                await schedule_urls(submitted_urls)
+
+            if active_tasks:
+                idle_started_at = None
+            else:
+                if idle_started_at is None:
+                    idle_started_at = loop.time()
+                elif loop.time() - idle_started_at >= 2.0:
+                    break
+            await asyncio.sleep(0.1)
     except asyncio.CancelledError:
-        for task in job_tasks:
+        for task in list(active_tasks):
             task.cancel()
-        await asyncio.gather(*job_tasks, return_exceptions=True)
+        await asyncio.gather(*all_tasks, return_exceptions=True)
         for job in jobs:
             if job.status not in {"completed", "error"}:
                 job.status = "error"
@@ -166,6 +305,7 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
                 job.error = "Cancelled by user"
         raise
     finally:
+        await asyncio.gather(*all_tasks, return_exceptions=True)
         printer.stop()
         await printer_task
     return jobs

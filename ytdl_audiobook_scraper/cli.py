@@ -17,7 +17,7 @@ from .utils import DEFAULT_AUDIO_QUALITY, DEFAULT_SEGMENT_MINUTES, default_downl
 
 def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
     parser = argparse.ArgumentParser(
-        description="Download YouTube audio as MP3, normalize naming, and split into chapters.",
+        description="Download YouTube audio as MP3, speed up to 1.25x, and split into chapters.",
     )
     parser.add_argument("urls", nargs="*", help="One or more YouTube video URLs.")
     parser.add_argument(
