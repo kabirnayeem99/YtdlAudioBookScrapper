@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 
 DEFAULT_SEGMENT_MINUTES = 20
-DEFAULT_AUDIO_QUALITY = "5"  # yt-dlp uses 0(best) to 9(worst); 5 ~= medium
+DEFAULT_AUDIO_QUALITY = "3"  # yt-dlp uses 0(best) to 9(worst); 5 ~= medium
 
 
 def ensure_dependency(binary: str) -> None:
