@@ -5,12 +5,12 @@ Download YouTube audio as MP3, normalize file names, speed audio up to `1.25x`, 
 ## What It Does
 
 - Downloads one or more YouTube URLs with `yt-dlp`
-- Extracts audio as MP3
+- Extracts compact, speech-focused MP3 audio
 - Normalizes output names to safe lowercase slugs
 - Speeds each track up to `1.25x` before segmentation
 - Splits each MP3 into segments with `ffmpeg`
 - Deletes the full-length MP3 after segmentation
-- Expands YouTube playlist URLs into per-video jobs
+- Expands YouTube playlist URLs into per-video jobs nested under the playlist folder
 - Runs downloads concurrently in a live TUI where you can paste more URLs while jobs run
 
 ## Requirements
@@ -69,7 +69,7 @@ python3 ytdl_audiobook_scraper.py [OPTIONS] URL [URL ...]
 - `-f, --file FILE`: Text file with one URL per line (`#` comments are ignored)
 - `-j, --jobs N`: Parallel job count (default: half CPU cores, minimum `1`)
 - `--segment-minutes N`: Segment length in minutes (default: `20`)
-- `--audio-quality N`: `yt-dlp` quality (`0` best, `9` worst; default `5`)
+- `--audio-quality N`: `yt-dlp` quality (`0` best, `10` worst; default `6` for speech)
 - `--no-color`: Disable ANSI colors in the live progress view
 
 ### Examples
@@ -87,18 +87,27 @@ ytdl-audiobook --file videos_to_download.txt
 # Custom output directory + segment size
 ytdl-audiobook --directory ~/AudioBooks --segment-minutes 15 --jobs 4 --file videos_to_download.txt
 
-# Playlist URL (each video becomes a queued job)
+# Playlist URL (each video becomes a queued job in its playlist folder)
 ytdl-audiobook "https://www.youtube.com/playlist?list=PLAYLIST_ID"
 ```
 
 ## Output Layout
 
-Each source URL creates a folder under the destination directory:
+Standalone URLs create a folder under the destination directory:
 
 ```text
 <destination>/<normalized-title>/
   <normalized-title>_part_000.mp3
   <normalized-title>_part_001.mp3
+  ...
+```
+
+Playlist videos retain their playlist folder, then use the same per-video folder and 20-minute segments:
+
+```text
+<destination>/<normalized-playlist-title>/<normalized-video-title>/
+  <normalized-video-title>_part_000.mp3
+  <normalized-video-title>_part_001.mp3
   ...
 ```
 
