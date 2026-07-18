@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 
 DEFAULT_SEGMENT_MINUTES = 20
-DEFAULT_AUDIO_QUALITY = "3"  # yt-dlp uses 0(best) to 9(worst); 5 ~= medium
+DEFAULT_AUDIO_QUALITY = "6"  # yt-dlp uses 0(best) to 10(worst); optimized for speech
 
 
 def ensure_dependency(binary: str) -> None:
@@ -28,11 +28,9 @@ def default_download_dir() -> Path:
 
 
 def normalize_name(content: str) -> str:
-    """Lowercase and strip problematic characters while keeping intent."""
-
-    lowered = content.strip().lower()
-    lowered = lowered.replace(" ", "_")
-    lowered = re.sub(r"[^a-z0-9._-]", "", lowered)
-    lowered = re.sub(r"_+", "_", lowered)
-    lowered = lowered.strip("._-")
-    return lowered or "ytdl_audio"
+    cleaned = content.strip()
+    cleaned = cleaned.replace(" ", "_").replace("-", "_").replace("/", "_").replace("\\", "_")
+    cleaned = re.sub(r"[^a-zA-Z0-9ঀ-৿._]", "", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned)
+    cleaned = cleaned.strip("._")
+    return cleaned or "ytdl_audio"

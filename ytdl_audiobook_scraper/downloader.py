@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import signal
 import shutil
 import tempfile
@@ -16,6 +17,14 @@ from .jobs import Job
 from .utils import ensure_dependency, normalize_name
 
 SPEED_MULTIPLIER = "1.25"
+
+
+@dataclass(frozen=True)
+class PlaylistEntry:
+    """A video URL and its optional playlist output folder."""
+
+    url: str
+    playlist_name: str | None = None
 
 
 async def run_command(cmd: List[str], job: Job, phase: str) -> None:
@@ -90,33 +99,35 @@ def normalize_playlist_entry(url_or_id: str) -> str:
     return f"https://www.youtube.com/watch?v={url_or_id}"
 
 
-async def expand_playlist_url(url: str) -> List[str]:
+async def expand_playlist_url(url: str) -> List[PlaylistEntry]:
     if not is_youtube_playlist_url(url):
-        return [url]
+        return [PlaylistEntry(url)]
 
     lines = await run_capture_output(
         [
             "yt-dlp",
             "--flat-playlist",
             "--print",
-            "%(webpage_url)s",
+            "%(playlist_title)s\t%(webpage_url)s",
             "--skip-download",
             "--no-warnings",
             url,
         ]
     )
     if not lines:
-        return [url]
+        return [PlaylistEntry(url)]
 
-    expanded: List[str] = []
+    expanded: List[PlaylistEntry] = []
     seen: Set[str] = set()
     for line in lines:
-        normalized = normalize_playlist_entry(line)
+        playlist_title, separator, entry_url = line.partition("\t")
+        normalized = normalize_playlist_entry(entry_url if separator else playlist_title)
         if normalized in seen:
             continue
         seen.add(normalized)
-        expanded.append(normalized)
-    return expanded or [url]
+        playlist_name = normalize_name(playlist_title) if separator and playlist_title else "playlist"
+        expanded.append(PlaylistEntry(normalized, playlist_name))
+    return expanded or [PlaylistEntry(url)]
 
 
 def parse_submitted_urls(submissions: List[str]) -> List[str]:
@@ -135,10 +146,36 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
         with tempfile.TemporaryDirectory(prefix="ytdl-job-") as tmp_dir:
             tmp_path = Path(tmp_dir)
             try:
+                # Resume check: fetch title and see if segments already exist
                 job.status = "downloading"
+                job.message = "checking..."
+                try:
+                    title_lines = await run_capture_output([
+                        "yt-dlp", "--print", "title",
+                        "--no-playlist", "--no-warnings", job.url,
+                    ])
+                    if title_lines:
+                        candidate = normalize_name(title_lines[0])
+                        candidate_dir = job.base_dir / candidate
+                        if list(candidate_dir.glob(f"{candidate}_part_*.mp3")):
+                            job.display_name = candidate
+                            job.output_dir = candidate_dir
+                            job.status = "completed"
+                            job.message = f"resumed: {candidate_dir}"
+                            return
+                except Exception:
+                    pass
+
+                job.message = ""
+                # Prefer an audio-only stream at or below 128 kbps and fetch
+                # fragments concurrently; speech remains clear after the final mono encode.
                 await run_command(
                     [
                         "yt-dlp",
+                        "--format",
+                        "ba[abr<=128]/ba/b",
+                        "--concurrent-fragments",
+                        "4",
                         job.url,
                         "--no-playlist",
                         "--newline",
@@ -169,7 +206,7 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                 job.output_dir = target_dir
 
                 job.status = "speeding"
-                sped_up_file = target_dir / f"{safe_name}_speedup.mp3"
+                segment_pattern = target_dir / f"{safe_name}_part_%03d.mp3"
                 await run_command(
                     [
                         "ffmpeg",
@@ -181,31 +218,14 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                         str(final_file),
                         "-filter:a",
                         f"atempo={SPEED_MULTIPLIER}",
+                        "-ac",
+                        "1",
                         "-q:a",
-                        "2",
-                        str(sped_up_file),
-                    ],
-                    job,
-                    "ffmpeg speed-up",
-                )
-                shutil.move(str(sped_up_file), final_file)
-
-                job.status = "splitting"
-                segment_pattern = target_dir / f"{safe_name}_part_%03d.mp3"
-                await run_command(
-                    [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-i",
-                        str(final_file),
+                        "5",
                         "-f",
                         "segment",
                         "-segment_time",
                         str(job.segment_seconds),
-                        "-c",
-                        "copy",
                         str(segment_pattern),
                     ],
                     job,
@@ -250,12 +270,12 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
         for job in jobs:
             job.total = total
 
-    def schedule_job(url: str) -> None:
+    def schedule_job(url: str, base_dir: Path) -> None:
         job = Job(
             index=len(jobs) + 1,
             total=0,
             url=url,
-            base_dir=settings.destination,
+            base_dir=base_dir,
             segment_seconds=settings.segment_seconds,
             audio_quality=settings.audio_quality,
         )
@@ -271,9 +291,14 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
             try:
                 expanded_urls = await expand_playlist_url(url)
             except Exception:
-                expanded_urls = [url]
-            for expanded_url in expanded_urls:
-                schedule_job(expanded_url)
+                expanded_urls = [PlaylistEntry(url)]
+            for entry in expanded_urls:
+                playlist_dir = (
+                    settings.destination / entry.playlist_name
+                    if entry.playlist_name
+                    else settings.destination
+                )
+                schedule_job(entry.url, playlist_dir)
 
     printer = LivePrinter(jobs, disable_color=settings.disable_color)
     printer_task = asyncio.create_task(printer.run())

@@ -46,7 +46,7 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
     parser.add_argument(
         "--audio-quality",
         default=DEFAULT_AUDIO_QUALITY,
-        help="yt-dlp audio quality knob (0=best, 9=worst, default: 5 for medium).",
+        help="yt-dlp audio quality knob (0=best, 10=worst, default: 6 for speech).",
     )
     parser.add_argument(
         "--no-color",
@@ -60,7 +60,7 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
     if args.file:
         url_candidates.extend(read_urls_from_file(Path(args.file), parser))
 
-    url_candidates = [url.strip() for url in url_candidates if url and url.strip()]
+    url_candidates = [url.strip().replace("\\", "") for url in url_candidates if url and url.strip()]
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
     if args.segment_minutes < 1:
@@ -82,7 +82,7 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
 
 def default_job_count() -> int:
     count = os.cpu_count() or 2
-    return max(1, count // 2)
+    return max(2, min(count, 4))
 
 
 def read_urls_from_file(path: Path, parser: argparse.ArgumentParser) -> List[str]:
