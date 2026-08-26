@@ -41,17 +41,22 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
         "--segment-minutes",
         type=int,
         default=DEFAULT_SEGMENT_MINUTES,
-        help="Length of each slice in minutes (default: 20).",
+        help=f"Length of each slice in minutes (default: {DEFAULT_SEGMENT_MINUTES}).",
     )
     parser.add_argument(
         "--audio-quality",
         default=DEFAULT_AUDIO_QUALITY,
-        help="yt-dlp audio quality knob (0=best, 10=worst, default: 6 for speech).",
+        help="yt-dlp audio quality knob (0=best, 10=worst, default: 8; low is fine for speech).",
     )
     parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable ANSI color escapes in the progress board.",
+    )
+    parser.add_argument(
+        "--no-vocal-isolation",
+        action="store_true",
+        help="Skip the demucs vocal-isolation pass (keeps background music).",
     )
 
     args = parser.parse_args(argv)
@@ -77,6 +82,7 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
         segment_minutes=args.segment_minutes,
         audio_quality=args.audio_quality,
         disable_color=args.no_color,
+        isolate_vocals=not args.no_vocal_isolation,
     )
 
 

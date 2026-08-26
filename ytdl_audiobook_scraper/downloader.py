@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import signal
-import shutil
 import tempfile
 from pathlib import Path
 from typing import List, Set
@@ -167,13 +166,14 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                     pass
 
                 job.message = ""
-                # Prefer an audio-only stream at or below 128 kbps and fetch
-                # fragments concurrently; speech remains clear after the final mono encode.
+                # Prefer a low-bitrate audio-only stream and fetch fragments
+                # concurrently; speech stays intelligible well below music-grade
+                # bitrates, and a smaller source also speeds up vocal isolation.
                 await run_command(
                     [
                         "yt-dlp",
                         "--format",
-                        "ba[abr<=128]/ba/b",
+                        "ba[abr<=96]/ba/b",
                         "--concurrent-fragments",
                         "4",
                         job.url,
@@ -200,10 +200,30 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                 job.display_name = safe_name
                 target_dir = job.base_dir / safe_name
                 target_dir.mkdir(parents=True, exist_ok=True)
-                job.status = "renaming"
-                final_file = target_dir / f"{safe_name}.mp3"
-                shutil.move(str(downloaded), final_file)
                 job.output_dir = target_dir
+
+                segment_source = downloaded
+                if job.isolate_vocals:
+                    job.status = "isolating"
+                    separated_dir = tmp_path / "separated"
+                    await run_command(
+                        [
+                            "demucs",
+                            "--two-stems",
+                            "vocals",
+                            "--mp3",
+                            "-o",
+                            str(separated_dir),
+                            str(downloaded),
+                        ],
+                        job,
+                        "demucs",
+                    )
+                    vocals_file = separated_dir / "htdemucs" / downloaded.stem / "vocals.mp3"
+                    if vocals_file.exists():
+                        segment_source = vocals_file
+                    else:
+                        job.message = "vocal isolation produced no output; using original audio"
 
                 job.status = "speeding"
                 segment_pattern = target_dir / f"{safe_name}_part_%03d.mp3"
@@ -215,13 +235,15 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                         "error",
                         "-y",
                         "-i",
-                        str(final_file),
+                        str(segment_source),
                         "-filter:a",
                         f"atempo={SPEED_MULTIPLIER}",
                         "-ac",
                         "1",
-                        "-q:a",
-                        "5",
+                        "-ar",
+                        "22050",
+                        "-b:a",
+                        "40k",
                         "-f",
                         "segment",
                         "-segment_time",
@@ -231,9 +253,6 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                     job,
                     "ffmpeg",
                 )
-
-                if final_file.exists():
-                    final_file.unlink()
 
                 job.status = "completed"
                 job.message = str(target_dir)
@@ -259,6 +278,8 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
 
     ensure_dependency("yt-dlp")
     ensure_dependency("ffmpeg")
+    if settings.isolate_vocals:
+        ensure_dependency("demucs")
 
     jobs: List[Job] = []
     semaphore = asyncio.Semaphore(settings.jobs)
@@ -278,6 +299,7 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
             base_dir=base_dir,
             segment_seconds=settings.segment_seconds,
             audio_quality=settings.audio_quality,
+            isolate_vocals=settings.isolate_vocals,
         )
         jobs.append(job)
         refresh_totals()

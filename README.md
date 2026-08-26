@@ -5,11 +5,11 @@ Download YouTube audio as MP3, normalize file names, speed audio up to `1.25x`, 
 ## What It Does
 
 - Downloads one or more YouTube URLs with `yt-dlp`
-- Extracts compact, speech-focused MP3 audio
+- Extracts compact, speech-focused, low-bitrate audio
+- Isolates vocals with `demucs` to strip out background music/intro-outro jingles
 - Normalizes output names to safe lowercase slugs
 - Speeds each track up to `1.25x` before segmentation
-- Splits each MP3 into segments with `ffmpeg`
-- Deletes the full-length MP3 after segmentation
+- Splits each MP3 into small, mono, low-bitrate segments with `ffmpeg`
 - Expands YouTube playlist URLs into per-video jobs nested under the playlist folder
 - Runs downloads concurrently in a live TUI where you can paste more URLs while jobs run
 
@@ -18,6 +18,7 @@ Download YouTube audio as MP3, normalize file names, speed audio up to `1.25x`, 
 - Python `3.9+`
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) available in `PATH`
 - [`ffmpeg`](https://ffmpeg.org/) available in `PATH`
+- [`demucs`](https://github.com/facebookresearch/demucs) available in `PATH` (`pip install demucs`) — used for vocal isolation; skip with `--no-vocal-isolation` if you don't want to install it
 
 ## Installation
 
@@ -68,8 +69,9 @@ python3 ytdl_audiobook_scraper.py [OPTIONS] URL [URL ...]
 - `-d, --directory DIR`: Destination directory (default: `~/Downloads` or `$DOWNLOADS`)
 - `-f, --file FILE`: Text file with one URL per line (`#` comments are ignored)
 - `-j, --jobs N`: Parallel job count (default: half CPU cores, minimum `1`)
-- `--segment-minutes N`: Segment length in minutes (default: `20`)
-- `--audio-quality N`: `yt-dlp` quality (`0` best, `10` worst; default `6` for speech)
+- `--segment-minutes N`: Segment length in minutes (default: `30`)
+- `--audio-quality N`: `yt-dlp` quality (`0` best, `10` worst; default `8`, low is fine for speech-only audiobooks)
+- `--no-vocal-isolation`: Skip the `demucs` vocal-isolation pass and keep background music
 - `--no-color`: Disable ANSI colors in the live progress view
 
 ### Examples
@@ -102,7 +104,7 @@ Standalone URLs create a folder under the destination directory:
   ...
 ```
 
-Playlist videos retain their playlist folder, then use the same per-video folder and 20-minute segments:
+Playlist videos retain their playlist folder, then use the same per-video folder and 30-minute segments:
 
 ```text
 <destination>/<normalized-playlist-title>/<normalized-video-title>/

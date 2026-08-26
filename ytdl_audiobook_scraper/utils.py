@@ -7,8 +7,8 @@ import re
 import shutil
 from pathlib import Path
 
-DEFAULT_SEGMENT_MINUTES = 20
-DEFAULT_AUDIO_QUALITY = "6"  # yt-dlp uses 0(best) to 10(worst); optimized for speech
+DEFAULT_SEGMENT_MINUTES = 30
+DEFAULT_AUDIO_QUALITY = "8"  # yt-dlp uses 0(best) to 10(worst); low is fine for speech-only audiobooks
 
 
 def ensure_dependency(binary: str) -> None:

@@ -4,16 +4,16 @@ Guidance for contributors and coding agents working in this repository.
 
 ## Project Context
 
-This project is a Python CLI that turns YouTube videos into audiobook-style MP3 chunks using `yt-dlp` and `ffmpeg`.
+This project is a Python CLI that turns YouTube videos into audiobook-style MP3 chunks using `yt-dlp`, `demucs`, and `ffmpeg`.
 
 Core flow:
 
 1. Parse CLI inputs (`urls` + optional `--file`)
-2. Validate dependencies (`yt-dlp`, `ffmpeg`)
-3. Download audio to a temporary directory
+2. Validate dependencies (`yt-dlp`, `ffmpeg`, and `demucs` unless `--no-vocal-isolation`)
+3. Download low-bitrate audio to a temporary directory
 4. Normalize title -> deterministic safe output name
-5. Move final MP3 into destination folder
-6. Segment the MP3 into fixed-duration parts
+5. Run `demucs` two-stems vocal isolation to strip background music (unless disabled)
+6. Segment the (isolated) audio into fixed-duration, mono, low-bitrate parts directly into the destination folder
 7. Render live multi-job progress in terminal
 
 ## Engineering Rules
@@ -47,7 +47,8 @@ Core flow:
 
 ## Dependency Policy
 
-- Runtime dependencies are Python stdlib + external binaries (`yt-dlp`, `ffmpeg`).
+- Runtime dependencies are Python stdlib + external binaries (`yt-dlp`, `ffmpeg`, `demucs`).
+- `demucs` was added to isolate vocals and strip background music from downloaded audiobooks; it can be skipped per-run via `--no-vocal-isolation` for users who don't want the extra install/runtime cost.
 - If a Python package addition is proposed, document why stdlib is insufficient.
 
 ## Validation Checklist (Before Finishing Changes)

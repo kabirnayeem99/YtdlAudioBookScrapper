@@ -15,6 +15,7 @@ class Job:
     base_dir: Path
     segment_seconds: int
     audio_quality: str
+    isolate_vocals: bool = True
     display_name: str = field(default_factory=str)
     status: str = "pending"
     message: str = "queued"

@@ -16,12 +16,12 @@ except ImportError:  # pragma: no cover
     curses = None
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-ACTIVE_STATES  = {"downloading", "renaming", "speeding", "splitting"}
+ACTIVE_STATES  = {"downloading", "isolating", "speeding", "splitting"}
 
 STATE_LABELS = {
     "pending":     "queued",
     "downloading": "download",
-    "renaming":    "rename",
+    "isolating":   "isolate",
     "speeding":    "speedup",
     "splitting":   "split",
     "completed":   "done",
@@ -36,7 +36,7 @@ STATE_ICONS = {
 
 # curses color pair IDs
 _CP_DOWNLOAD = 1
-_CP_RENAME   = 2
+_CP_ISOLATE  = 2
 _CP_SPEED    = 3
 _CP_SPLIT    = 4
 _CP_DONE     = 5
@@ -65,7 +65,7 @@ def colorize(text: str, status: str, *, disable: bool) -> str:
         "downloading": "\x1b[1;36m",
         "speeding":    "\x1b[1;34m",
         "splitting":   "\x1b[1;33m",
-        "renaming":    "\x1b[1;35m",
+        "isolating":   "\x1b[1;35m",
         "error":       "\x1b[1;31m",
     }
     color = palette.get(status)
@@ -171,7 +171,7 @@ class LivePrinter:
                 pass
             if has_colors:
                 curses.init_pair(_CP_DOWNLOAD, curses.COLOR_CYAN,    -1)
-                curses.init_pair(_CP_RENAME,   curses.COLOR_MAGENTA, -1)
+                curses.init_pair(_CP_ISOLATE,  curses.COLOR_MAGENTA, -1)
                 curses.init_pair(_CP_SPEED,    curses.COLOR_BLUE,    -1)
                 curses.init_pair(_CP_SPLIT,    curses.COLOR_YELLOW,  -1)
                 curses.init_pair(_CP_DONE,     curses.COLOR_GREEN,   -1)
@@ -320,7 +320,7 @@ class LivePrinter:
             return 0
         mapping = {
             "downloading": curses.color_pair(_CP_DOWNLOAD) | curses.A_BOLD,
-            "renaming":    curses.color_pair(_CP_RENAME),
+            "isolating":   curses.color_pair(_CP_ISOLATE),
             "speeding":    curses.color_pair(_CP_SPEED)    | curses.A_BOLD,
             "splitting":   curses.color_pair(_CP_SPLIT)    | curses.A_BOLD,
             "completed":   curses.color_pair(_CP_DONE)     | curses.A_BOLD,
