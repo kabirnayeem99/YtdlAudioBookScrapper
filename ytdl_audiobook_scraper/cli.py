@@ -56,7 +56,17 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
     parser.add_argument(
         "--no-vocal-isolation",
         action="store_true",
-        help="Skip the demucs vocal-isolation pass (keeps background music).",
+        help="Skip the audio-separator vocal-isolation pass (keeps background music).",
+    )
+    parser.add_argument(
+        "--isolate-jobs",
+        type=int,
+        default=4,
+        help=(
+            "Parallel vocal-isolation jobs, separate from --jobs (default: 4). "
+            "Downloading and segmenting are never blocked by isolation; this only "
+            "limits how many audio-separator processes run at once."
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -68,6 +78,8 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
     url_candidates = [url.strip().replace("\\", "") for url in url_candidates if url and url.strip()]
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
+    if args.isolate_jobs < 1:
+        parser.error("--isolate-jobs must be >= 1")
     if args.segment_minutes < 1:
         parser.error("--segment-minutes must be >= 1")
     if not url_candidates:
@@ -83,6 +95,7 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
         audio_quality=args.audio_quality,
         disable_color=args.no_color,
         isolate_vocals=not args.no_vocal_isolation,
+        isolate_jobs=args.isolate_jobs,
     )
 
 

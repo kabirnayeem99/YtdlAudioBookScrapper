@@ -16,6 +16,7 @@ class DownloadSettings:
     audio_quality: str
     disable_color: bool
     isolate_vocals: bool = True
+    isolate_jobs: int = 4
 
     @property
     def segment_seconds(self) -> int:

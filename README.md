@@ -6,19 +6,20 @@ Download YouTube audio as MP3, normalize file names, speed audio up to `1.25x`, 
 
 - Downloads one or more YouTube URLs with `yt-dlp`
 - Extracts compact, speech-focused, low-bitrate audio
-- Isolates vocals with `demucs` to strip out background music/intro-outro jingles
+- Isolates vocals with `audio-separator` (MDX-Net) to strip out background music/intro-outro jingles
 - Normalizes output names to safe lowercase slugs
 - Speeds each track up to `1.25x` before segmentation
 - Splits each MP3 into small, mono, low-bitrate segments with `ffmpeg`
 - Expands YouTube playlist URLs into per-video jobs nested under the playlist folder
 - Runs downloads concurrently in a live TUI where you can paste more URLs while jobs run
+- Skips re-downloading videos that already have output in the destination folder (see Resuming below)
 
 ## Requirements
 
 - Python `3.9+`
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) available in `PATH`
 - [`ffmpeg`](https://ffmpeg.org/) available in `PATH`
-- [`demucs`](https://github.com/facebookresearch/demucs) available in `PATH` (`pip install demucs`) — used for vocal isolation; skip with `--no-vocal-isolation` if you don't want to install it
+- [`audio-separator`](https://github.com/nomadkaraoke/python-audio-separator) available in `PATH` (`pipx install "audio-separator[cpu]"` — on Apple Silicon the base `onnxruntime` wheel already includes CoreML acceleration) — used for vocal isolation; skip with `--no-vocal-isolation` if you don't want to install it
 
 ## Installation
 
@@ -71,7 +72,7 @@ python3 ytdl_audiobook_scraper.py [OPTIONS] URL [URL ...]
 - `-j, --jobs N`: Parallel job count (default: half CPU cores, minimum `1`)
 - `--segment-minutes N`: Segment length in minutes (default: `30`)
 - `--audio-quality N`: `yt-dlp` quality (`0` best, `10` worst; default `8`, low is fine for speech-only audiobooks)
-- `--no-vocal-isolation`: Skip the `demucs` vocal-isolation pass and keep background music
+- `--no-vocal-isolation`: Skip the `audio-separator` vocal-isolation pass and keep background music
 - `--no-color`: Disable ANSI colors in the live progress view
 
 ### Examples
@@ -119,6 +120,21 @@ Name normalization rules:
 - Spaces become `_`
 - Characters outside `[a-z0-9._-]` are removed
 - Empty results fall back to `ytdl_audio`
+
+## Resuming
+
+Before downloading a URL, the tool checks whether `<destination>/<normalized-title>/` already
+has `_part_*.mp3` files and, if so, skips re-downloading it entirely.
+
+- If vocal isolation is on and that folder already has a `.isolated` marker file, the job is
+  reported as fully `done`.
+- If vocal isolation is on but the folder has no marker (e.g. a previous run was interrupted
+  after downloading but before isolation finished), the job is reported as `ready` (usable,
+  background music not removed) and is left alone — the original pre-isolation audio only ever
+  existed in a temp directory, so isolating it now would require re-downloading. Delete that
+  video's folder and re-run if you want it isolated.
+- `--no-vocal-isolation` always treats existing `_part_*.mp3` files as fully done, regardless
+  of the marker.
 
 ## Exit Codes
 

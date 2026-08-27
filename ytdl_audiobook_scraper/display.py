@@ -24,12 +24,14 @@ STATE_LABELS = {
     "isolating":   "isolate",
     "speeding":    "speedup",
     "splitting":   "split",
+    "ready":       "ready",
     "completed":   "done",
     "error":       "error",
 }
 
 STATE_ICONS = {
     "pending":   "◦",
+    "ready":     "◆",
     "completed": "✓",
     "error":     "✗",
 }
@@ -45,6 +47,7 @@ _CP_HEADER   = 7
 _CP_DIM      = 8
 _CP_INPUT    = 9
 _CP_PROGRESS = 10
+_CP_READY    = 11
 
 
 def truncate(text: str, width: int) -> str:
@@ -66,6 +69,7 @@ def colorize(text: str, status: str, *, disable: bool) -> str:
         "speeding":    "\x1b[1;34m",
         "splitting":   "\x1b[1;33m",
         "isolating":   "\x1b[1;35m",
+        "ready":       "\x1b[0;32m",
         "error":       "\x1b[1;31m",
     }
     color = palette.get(status)
@@ -180,6 +184,7 @@ class LivePrinter:
                 curses.init_pair(_CP_DIM,      curses.COLOR_WHITE,   -1)
                 curses.init_pair(_CP_INPUT,    curses.COLOR_CYAN,    -1)
                 curses.init_pair(_CP_PROGRESS, curses.COLOR_GREEN,   -1)
+                curses.init_pair(_CP_READY,    curses.COLOR_GREEN,   -1)
 
         try:
             while not self._stopped.is_set():
@@ -249,6 +254,7 @@ class LivePrinter:
 
         total  = len(self.jobs)
         done   = sum(1 for j in self.jobs if j.status == "completed")
+        ready  = sum(1 for j in self.jobs if j.status == "ready")
         failed = sum(1 for j in self.jobs if j.status == "error")
         active = sum(1 for j in self.jobs if j.status in ACTIVE_STATES)
         queued = sum(1 for j in self.jobs if j.status == "pending")
@@ -257,7 +263,7 @@ class LivePrinter:
         hdr = (
             f" ♪ YtdlAudioBook   "
             f"{done}/{total} done  "
-            f"{active} active  {queued} queued  {failed} failed "
+            f"{ready} ready  {active} active  {queued} queued  {failed} failed "
         )
         hdr_attr = (curses.color_pair(_CP_HEADER) | curses.A_BOLD) if has_colors else curses.A_BOLD
         screen.addnstr(0, 0, hdr.ljust(W)[:W], W, hdr_attr)
@@ -323,6 +329,7 @@ class LivePrinter:
             "isolating":   curses.color_pair(_CP_ISOLATE),
             "speeding":    curses.color_pair(_CP_SPEED)    | curses.A_BOLD,
             "splitting":   curses.color_pair(_CP_SPLIT)    | curses.A_BOLD,
+            "ready":       curses.color_pair(_CP_READY),
             "completed":   curses.color_pair(_CP_DONE)     | curses.A_BOLD,
             "error":       curses.color_pair(_CP_ERROR)    | curses.A_BOLD,
             "pending":     curses.color_pair(_CP_DIM),
@@ -335,7 +342,9 @@ class LivePrinter:
         else:
             icon = STATE_ICONS.get(job.status, "?")
         label = STATE_LABELS.get(job.status, job.status)
-        base = f" {icon} [{job.index}/{job.total}] {label:<9} {job.label()}"
+        width_digits = len(str(job.total))
+        index_str = str(job.index).zfill(width_digits)
+        base = f" {icon} [{index_str}/{job.total}] {label:<9} {job.label()}"
         message = job.message
         if not message:
             return base

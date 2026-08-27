@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import shutil
 import signal
+import sys
 import tempfile
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set
 from urllib.parse import parse_qs, urlparse
 
 from .config import DownloadSettings
@@ -16,6 +18,15 @@ from .jobs import Job
 from .utils import ensure_dependency, normalize_name
 
 SPEED_MULTIPLIER = "1.25"
+
+# Marker dropped in a job's output folder once vocal isolation has actually
+# succeeded, so a later resumed run can tell "downloaded" apart from "fully
+# done" without needing to re-download anything to check.
+ISOLATED_MARKER_NAME = ".isolated"
+
+# MDX-Net model used for vocal isolation. audio-separator auto-detects the
+# best available backend itself (CoreML/MPS on Apple Silicon, CUDA, else CPU).
+AUDIO_SEPARATOR_MODEL = "UVR-MDX-NET-Voc_FT.onnx"
 
 
 @dataclass(frozen=True)
@@ -140,10 +151,73 @@ def parse_submitted_urls(submissions: List[str]) -> List[str]:
     return urls
 
 
-async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
-    async with semaphore:
-        with tempfile.TemporaryDirectory(prefix="ytdl-job-") as tmp_dir:
-            tmp_path = Path(tmp_dir)
+async def speed_and_segment(source: Path, segment_pattern: Path, job: Job) -> None:
+    await run_command(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source),
+            "-filter:a",
+            f"atempo={SPEED_MULTIPLIER}",
+            "-ac",
+            "1",
+            "-ar",
+            "22050",
+            "-b:a",
+            "40k",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(job.segment_seconds),
+            str(segment_pattern),
+        ],
+        job,
+        "ffmpeg",
+    )
+
+
+async def isolate_vocals(downloaded: Path, tmp_path: Path, job: Job) -> Optional[Path]:
+    """Run audio-separator on the downloaded audio; return the vocals-only file, or None if unavailable."""
+
+    separated_dir = tmp_path / "separated"
+    separated_dir.mkdir(parents=True, exist_ok=True)
+    await run_command(
+        [
+            "audio-separator",
+            "-m",
+            AUDIO_SEPARATOR_MODEL,
+            "--single_stem",
+            "vocals",
+            "--output_format",
+            "WAV",
+            "--output_dir",
+            str(separated_dir),
+            str(downloaded),
+        ],
+        job,
+        "audio-separator",
+    )
+
+    vocals_file = separated_dir / f"{downloaded.stem}_(Vocals).wav"
+    return vocals_file if vocals_file.exists() else None
+
+
+async def process_job(
+    job: Job, download_semaphore: asyncio.Semaphore, isolate_semaphore: asyncio.Semaphore
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="ytdl-job-") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        downloaded: Optional[Path] = None
+        target_dir: Optional[Path] = None
+        safe_name: Optional[str] = None
+
+        # Phase 1: download + segment. Releases the download slot for the next
+        # job as soon as it's done, so downloads never wait on vocal isolation.
+        async with download_semaphore:
             try:
                 # Resume check: fetch title and see if segments already exist
                 job.status = "downloading"
@@ -159,8 +233,21 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                         if list(candidate_dir.glob(f"{candidate}_part_*.mp3")):
                             job.display_name = candidate
                             job.output_dir = candidate_dir
-                            job.status = "completed"
-                            job.message = f"resumed: {candidate_dir}"
+                            isolated = (candidate_dir / ISOLATED_MARKER_NAME).exists()
+                            if not job.isolate_vocals or isolated:
+                                job.status = "completed"
+                                job.message = f"resumed: {candidate_dir}"
+                            else:
+                                # Downloaded and segmented in a prior run, but that
+                                # run never finished vocal isolation. Nothing left
+                                # to re-download here; a fresh run is needed to
+                                # actually isolate these (the raw pre-isolation
+                                # audio was only ever a temp file).
+                                job.status = "ready"
+                                job.message = (
+                                    f"resumed, not vocal-isolated (delete folder and re-run "
+                                    f"to isolate): {candidate_dir}"
+                                )
                             return
                 except Exception:
                     pass
@@ -195,71 +282,56 @@ async def process_job(job: Job, semaphore: asyncio.Semaphore) -> None:
                 if not mp3_files:
                     raise RuntimeError("yt-dlp did not produce an MP3 file")
                 downloaded = mp3_files[0]
-                original_stem = downloaded.stem
-                safe_name = normalize_name(original_stem)
+                safe_name = normalize_name(downloaded.stem)
                 job.display_name = safe_name
                 target_dir = job.base_dir / safe_name
                 target_dir.mkdir(parents=True, exist_ok=True)
                 job.output_dir = target_dir
 
-                segment_source = downloaded
-                if job.isolate_vocals:
-                    job.status = "isolating"
-                    separated_dir = tmp_path / "separated"
-                    await run_command(
-                        [
-                            "demucs",
-                            "--two-stems",
-                            "vocals",
-                            "--mp3",
-                            "-o",
-                            str(separated_dir),
-                            str(downloaded),
-                        ],
-                        job,
-                        "demucs",
-                    )
-                    vocals_file = separated_dir / "htdemucs" / downloaded.stem / "vocals.mp3"
-                    if vocals_file.exists():
-                        segment_source = vocals_file
-                    else:
-                        job.message = "vocal isolation produced no output; using original audio"
-
                 job.status = "speeding"
                 segment_pattern = target_dir / f"{safe_name}_part_%03d.mp3"
-                await run_command(
-                    [
-                        "ffmpeg",
-                        "-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-i",
-                        str(segment_source),
-                        "-filter:a",
-                        f"atempo={SPEED_MULTIPLIER}",
-                        "-ac",
-                        "1",
-                        "-ar",
-                        "22050",
-                        "-b:a",
-                        "40k",
-                        "-f",
-                        "segment",
-                        "-segment_time",
-                        str(job.segment_seconds),
-                        str(segment_pattern),
-                    ],
-                    job,
-                    "ffmpeg",
-                )
+                await speed_and_segment(downloaded, segment_pattern, job)
 
-                job.status = "completed"
+                # "ready" means usable but not yet vocal-isolated; "completed"
+                # is reserved for jobs where isolation is done, skipped, or off.
+                job.status = "ready" if job.isolate_vocals else "completed"
                 job.message = str(target_dir)
             except Exception as exc:  # noqa: BLE001
                 job.status = "error"
                 job.message = str(exc)
                 job.error = str(exc)
+                return
+
+        # Phase 2: vocal isolation is a best-effort quality upgrade on top of
+        # the already-usable output above. It runs on its own (typically
+        # smaller, GPU-bound) concurrency pool and never fails the job -- if
+        # audio-separator is missing or errors out, the original audio stays in place.
+        if not job.isolate_vocals or downloaded is None:
+            return
+
+        async with isolate_semaphore:
+            try:
+                job.status = "isolating"
+                job.message = "removing background music..."
+                vocals_file = await isolate_vocals(downloaded, tmp_path, job)
+                if vocals_file is None:
+                    job.status = "completed"
+                    job.message = f"{target_dir} (vocal isolation produced no output; kept original audio)"
+                    return
+
+                job.status = "isolating"
+                job.message = "re-encoding isolated vocals..."
+                for stale in target_dir.glob(f"{safe_name}_part_*.mp3"):
+                    stale.unlink()
+                segment_pattern = target_dir / f"{safe_name}_part_%03d.mp3"
+                await speed_and_segment(vocals_file, segment_pattern, job)
+                (target_dir / ISOLATED_MARKER_NAME).touch()
+
+                job.status = "completed"
+                job.message = f"{target_dir} (background music removed)"
+            except Exception as exc:  # noqa: BLE001
+                job.status = "completed"
+                job.message = f"{target_dir} (vocal isolation failed, kept original audio: {exc})"
 
 
 def install_sigint_handler(loop: asyncio.AbstractEventLoop) -> None:
@@ -278,11 +350,17 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
 
     ensure_dependency("yt-dlp")
     ensure_dependency("ffmpeg")
-    if settings.isolate_vocals:
-        ensure_dependency("demucs")
+    if settings.isolate_vocals and shutil.which("audio-separator") is None:
+        # Not a hard requirement: downloads and segmenting work fine without
+        # it, vocal isolation just won't run for any job until it's on PATH.
+        print(
+            "Warning: audio-separator not found on PATH; downloads will proceed without vocal isolation.",
+            file=sys.stderr,
+        )
 
     jobs: List[Job] = []
-    semaphore = asyncio.Semaphore(settings.jobs)
+    download_semaphore = asyncio.Semaphore(settings.jobs)
+    isolate_semaphore = asyncio.Semaphore(settings.isolate_jobs)
     active_tasks: Set[asyncio.Task[None]] = set()
     all_tasks: List[asyncio.Task[None]] = []
 
@@ -303,13 +381,21 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
         )
         jobs.append(job)
         refresh_totals()
-        task = asyncio.create_task(process_job(job, semaphore))
+        task = asyncio.create_task(process_job(job, download_semaphore, isolate_semaphore))
         active_tasks.add(task)
         all_tasks.append(task)
         task.add_done_callback(active_tasks.discard)
 
     async def schedule_urls(urls: List[str]) -> None:
-        for url in urls:
+        # Queue standalone videos first so they start downloading immediately;
+        # playlists (which can expand into many jobs) are scheduled after.
+        single_urls = [url for url in urls if not is_youtube_playlist_url(url)]
+        playlist_urls = [url for url in urls if is_youtube_playlist_url(url)]
+
+        for url in single_urls:
+            schedule_job(url, settings.destination)
+
+        for url in playlist_urls:
             try:
                 expanded_urls = await expand_playlist_url(url)
             except Exception:
