@@ -61,11 +61,12 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
     parser.add_argument(
         "--isolate-jobs",
         type=int,
-        default=4,
+        default=None,
         help=(
-            "Parallel vocal-isolation jobs, separate from --jobs (default: 4). "
-            "Downloading and segmenting are never blocked by isolation; this only "
-            "limits how many audio-separator processes run at once."
+            "Parallel vocal-isolation jobs, separate from --jobs. Downloading and "
+            "segmenting are never blocked by isolation; this only limits how many "
+            "audio-separator processes run at once. Default: chosen automatically "
+            "based on available memory (2 with >=20GB free, else 1)."
         ),
     )
 
@@ -78,7 +79,7 @@ def parse_settings(argv: Optional[Iterable[str]] = None) -> DownloadSettings:
     url_candidates = [url.strip().replace("\\", "") for url in url_candidates if url and url.strip()]
     if args.jobs < 1:
         parser.error("--jobs must be >= 1")
-    if args.isolate_jobs < 1:
+    if args.isolate_jobs is not None and args.isolate_jobs < 1:
         parser.error("--isolate-jobs must be >= 1")
     if args.segment_minutes < 1:
         parser.error("--segment-minutes must be >= 1")

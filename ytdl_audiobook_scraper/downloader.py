@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import platform
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -18,6 +20,50 @@ from .jobs import Job
 from .utils import ensure_dependency, normalize_name
 
 SPEED_MULTIPLIER = "1.25"
+
+# audio-separator's model is memory-hungry; running many instances at once on
+# a low-memory machine causes swapping/OOM kills rather than any speedup.
+ISOLATE_JOBS_MEMORY_THRESHOLD_BYTES = 20 * 1024 ** 3
+
+
+def _available_memory_bytes() -> Optional[int]:
+    """Best-effort available-memory lookup. Returns None if it can't be determined."""
+    try:
+        import psutil  # type: ignore
+
+        return psutil.virtual_memory().available
+    except ImportError:
+        pass
+
+    system = platform.system()
+    try:
+        if system == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        elif system == "Darwin":
+            page_size = int(subprocess.check_output(["sysctl", "-n", "hw.pagesize"]).strip())
+            vm_stat = subprocess.check_output(["vm_stat"]).decode()
+            free_pages = 0
+            inactive_pages = 0
+            for line in vm_stat.splitlines():
+                if line.startswith("Pages free:"):
+                    free_pages = int(line.split(":")[1].strip().rstrip("."))
+                elif line.startswith("Pages inactive:"):
+                    inactive_pages = int(line.split(":")[1].strip().rstrip("."))
+            return (free_pages + inactive_pages) * page_size
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def default_isolate_jobs() -> int:
+    """Pick a safe vocal-isolation concurrency: 2 if memory is plentiful, else 1."""
+    available = _available_memory_bytes()
+    if available is not None and available >= ISOLATE_JOBS_MEMORY_THRESHOLD_BYTES:
+        return 2
+    return 1
 
 # Marker dropped in a job's output folder once vocal isolation has actually
 # succeeded, so a later resumed run can tell "downloaded" apart from "fully
@@ -166,9 +212,9 @@ async def speed_and_segment(source: Path, segment_pattern: Path, job: Job) -> No
             "-ac",
             "1",
             "-ar",
-            "22050",
+            "24000",
             "-b:a",
-            "40k",
+            "54k",
             "-f",
             "segment",
             "-segment_time",
@@ -206,6 +252,54 @@ async def isolate_vocals(downloaded: Path, tmp_path: Path, job: Job) -> Optional
     return vocals_file if vocals_file.exists() else None
 
 
+async def isolate_existing_segments(
+    target_dir: Path, safe_name: str, tmp_path: Path, job: Job
+) -> bool:
+    """Vocal-isolate segments that already exist on disk in place.
+
+    Used when a prior run downloaded and segmented a job but was killed
+    before vocal isolation ran -- the raw pre-segment audio no longer exists
+    (it was only ever a temp file), so isolation runs directly on the
+    already-segmented, already-sped-up part files instead. Returns True if
+    at least one segment was successfully isolated.
+    """
+    part_files = sorted(target_dir.glob(f"{safe_name}_part_*.mp3"))
+    if not part_files:
+        return False
+
+    any_isolated = False
+    for i, part_file in enumerate(part_files, start=1):
+        job.message = f"removing background music from resumed segments... ({i}/{len(part_files)})"
+        vocals_file = await isolate_vocals(part_file, tmp_path, job)
+        if vocals_file is None:
+            continue
+        reencoded = tmp_path / f"{part_file.stem}_reencoded.mp3"
+        await run_command(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(vocals_file),
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                "-b:a",
+                "54k",
+                str(reencoded),
+            ],
+            job,
+            "ffmpeg",
+        )
+        reencoded.replace(part_file)
+        vocals_file.unlink(missing_ok=True)
+        any_isolated = True
+    return any_isolated
+
+
 async def process_job(
     job: Job, download_semaphore: asyncio.Semaphore, isolate_semaphore: asyncio.Semaphore
 ) -> None:
@@ -214,6 +308,7 @@ async def process_job(
         downloaded: Optional[Path] = None
         target_dir: Optional[Path] = None
         safe_name: Optional[str] = None
+        resumed_pending_isolation = False
 
         # Phase 1: download + segment. Releases the download slot for the next
         # job as soon as it's done, so downloads never wait on vocal isolation.
@@ -237,65 +332,63 @@ async def process_job(
                             if not job.isolate_vocals or isolated:
                                 job.status = "completed"
                                 job.message = f"resumed: {candidate_dir}"
-                            else:
-                                # Downloaded and segmented in a prior run, but that
-                                # run never finished vocal isolation. Nothing left
-                                # to re-download here; a fresh run is needed to
-                                # actually isolate these (the raw pre-isolation
-                                # audio was only ever a temp file).
-                                job.status = "ready"
-                                job.message = (
-                                    f"resumed, not vocal-isolated (delete folder and re-run "
-                                    f"to isolate): {candidate_dir}"
-                                )
-                            return
+                                return
+                            # Downloaded and segmented in a prior run, but that run
+                            # was killed before vocal isolation finished. Nothing to
+                            # re-download; isolate the existing segments in place.
+                            job.status = "ready"
+                            job.message = f"resumed: {candidate_dir} (vocal isolation pending, resuming...)"
+                            target_dir = candidate_dir
+                            safe_name = candidate
+                            resumed_pending_isolation = True
                 except Exception:
                     pass
 
-                job.message = ""
-                # Prefer a low-bitrate audio-only stream and fetch fragments
-                # concurrently; speech stays intelligible well below music-grade
-                # bitrates, and a smaller source also speeds up vocal isolation.
-                await run_command(
-                    [
+                if not resumed_pending_isolation:
+                    job.message = ""
+                    # Prefer a low-bitrate audio-only stream and fetch fragments
+                    # concurrently; speech stays intelligible well below music-grade
+                    # bitrates, and a smaller source also speeds up vocal isolation.
+                    await run_command(
+                        [
+                            "yt-dlp",
+                            "--format",
+                            "ba[abr<=96]/ba/b",
+                            "--concurrent-fragments",
+                            "4",
+                            job.url,
+                            "--no-playlist",
+                            "--newline",
+                            "--extract-audio",
+                            "--audio-format",
+                            "mp3",
+                            "--audio-quality",
+                            job.audio_quality,
+                            "--output",
+                            str(tmp_path / "%(title)s.%(ext)s"),
+                        ],
+                        job,
                         "yt-dlp",
-                        "--format",
-                        "ba[abr<=96]/ba/b",
-                        "--concurrent-fragments",
-                        "4",
-                        job.url,
-                        "--no-playlist",
-                        "--newline",
-                        "--extract-audio",
-                        "--audio-format",
-                        "mp3",
-                        "--audio-quality",
-                        job.audio_quality,
-                        "--output",
-                        str(tmp_path / "%(title)s.%(ext)s"),
-                    ],
-                    job,
-                    "yt-dlp",
-                )
+                    )
 
-                mp3_files = sorted(tmp_path.glob("*.mp3"))
-                if not mp3_files:
-                    raise RuntimeError("yt-dlp did not produce an MP3 file")
-                downloaded = mp3_files[0]
-                safe_name = normalize_name(downloaded.stem)
-                job.display_name = safe_name
-                target_dir = job.base_dir / safe_name
-                target_dir.mkdir(parents=True, exist_ok=True)
-                job.output_dir = target_dir
+                    mp3_files = sorted(tmp_path.glob("*.mp3"))
+                    if not mp3_files:
+                        raise RuntimeError("yt-dlp did not produce an MP3 file")
+                    downloaded = mp3_files[0]
+                    safe_name = normalize_name(downloaded.stem)
+                    job.display_name = safe_name
+                    target_dir = job.base_dir / safe_name
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    job.output_dir = target_dir
 
-                job.status = "speeding"
-                segment_pattern = target_dir / f"{safe_name}_part_%03d.mp3"
-                await speed_and_segment(downloaded, segment_pattern, job)
+                    job.status = "speeding"
+                    segment_pattern = target_dir / f"{safe_name}_part_%03d.mp3"
+                    await speed_and_segment(downloaded, segment_pattern, job)
 
-                # "ready" means usable but not yet vocal-isolated; "completed"
-                # is reserved for jobs where isolation is done, skipped, or off.
-                job.status = "ready" if job.isolate_vocals else "completed"
-                job.message = str(target_dir)
+                    # "ready" means usable but not yet vocal-isolated; "completed"
+                    # is reserved for jobs where isolation is done, skipped, or off.
+                    job.status = "ready" if job.isolate_vocals else "completed"
+                    job.message = str(target_dir)
             except Exception as exc:  # noqa: BLE001
                 job.status = "error"
                 job.message = str(exc)
@@ -306,12 +399,27 @@ async def process_job(
         # the already-usable output above. It runs on its own (typically
         # smaller, GPU-bound) concurrency pool and never fails the job -- if
         # audio-separator is missing or errors out, the original audio stays in place.
-        if not job.isolate_vocals or downloaded is None:
+        if not job.isolate_vocals or (downloaded is None and not resumed_pending_isolation):
             return
 
         async with isolate_semaphore:
             try:
                 job.status = "isolating"
+
+                if resumed_pending_isolation:
+                    # No raw pre-segment audio survives a killed run -- isolate
+                    # directly on the segments already sitting on disk.
+                    job.message = "removing background music from resumed segments..."
+                    any_isolated = await isolate_existing_segments(target_dir, safe_name, tmp_path, job)
+                    if not any_isolated:
+                        job.status = "completed"
+                        job.message = f"{target_dir} (vocal isolation produced no output; kept original audio)"
+                        return
+                    (target_dir / ISOLATED_MARKER_NAME).touch()
+                    job.status = "completed"
+                    job.message = f"{target_dir} (background music removed)"
+                    return
+
                 job.message = "removing background music..."
                 vocals_file = await isolate_vocals(downloaded, tmp_path, job)
                 if vocals_file is None:
@@ -358,9 +466,11 @@ async def orchestrate(settings: DownloadSettings) -> List[Job]:
             file=sys.stderr,
         )
 
+    isolate_jobs = settings.isolate_jobs if settings.isolate_jobs is not None else default_isolate_jobs()
+
     jobs: List[Job] = []
     download_semaphore = asyncio.Semaphore(settings.jobs)
-    isolate_semaphore = asyncio.Semaphore(settings.isolate_jobs)
+    isolate_semaphore = asyncio.Semaphore(isolate_jobs)
     active_tasks: Set[asyncio.Task[None]] = set()
     all_tasks: List[asyncio.Task[None]] = []
 
